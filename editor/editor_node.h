@@ -43,6 +43,7 @@ typedef void (*EditorPluginInitializeCallback)();
 typedef bool (*EditorBuildCallback)();
 
 class AcceptDialog;
+class BoxContainer;
 class ColorPicker;
 class ConfirmationDialog;
 class Control;
@@ -79,6 +80,7 @@ class EditorExport;
 class EditorExportPreset;
 class EditorFeatureProfileManager;
 class EditorFileDialog;
+class EditorIconManager;
 class EditorFolding;
 class EditorLayoutsDialog;
 class EditorLog;
@@ -167,6 +169,7 @@ public:
 		// Project menu.
 		PROJECT_OPEN_SETTINGS,
 		PROJECT_FIND_IN_FILES,
+		PROJECT_REPLACE_IN_FILES,
 		PROJECT_VERSION_CONTROL,
 		PROJECT_EXPORT,
 		PROJECT_PACK_AS_ZIP,
@@ -178,6 +181,7 @@ public:
 		TOOLS_ORPHAN_RESOURCES,
 		TOOLS_BUILD_PROFILE_MANAGER,
 		TOOLS_PROJECT_UPGRADE,
+		TOOLS_CLEAR_PROJECT_CACHE,
 		TOOLS_CUSTOM,
 
 		VCS_METADATA,
@@ -292,8 +296,8 @@ private:
 	OptionButton *renderer = nullptr;
 
 #ifdef ANDROID_ENABLED
-	VBoxContainer *base_vbox = nullptr; // It only contains the title_bar and main_hbox.
-	HBoxContainer *main_hbox = nullptr; // It only contains the touch_actions_panel and main_vbox.
+	VBoxContainer *base_vbox = nullptr; // It only contains the title_bar and main_box.
+	BoxContainer *main_box = nullptr; // It only contains the touch_actions_panel and main_vbox.
 	TouchActionsPanel *touch_actions_panel = nullptr;
 	void _touch_actions_panel_mode_changed();
 #endif
@@ -359,6 +363,7 @@ private:
 	AcceptDialog *execute_output_dialog = nullptr;
 
 	Ref<Theme> theme;
+	EditorIconManager *icon_manager = nullptr;
 
 	bool follow_system_theme = false;
 	bool use_system_accent_color = false;
@@ -381,7 +386,6 @@ private:
 	ConfirmationDialog *pick_main_scene = nullptr;
 	ConfirmationDialog *open_project_settings = nullptr;
 	Button *select_current_scene_button = nullptr;
-	AcceptDialog *accept = nullptr;
 	AcceptDialog *save_accept = nullptr;
 	EditorAbout *about = nullptr;
 	AcceptDialog *warning = nullptr;
@@ -488,6 +492,9 @@ private:
 
 	ProjectUpgradeTool *project_upgrade_tool = nullptr;
 	bool run_project_upgrade_tool = false;
+	ConfirmationDialog *clear_cache_dialog = nullptr;
+
+	LocalVector<String> files_to_delete_on_exit;
 
 	bool was_window_windowed_last = false;
 
@@ -525,6 +532,7 @@ private:
 	static void _resource_saved(Ref<Resource> p_resource, const String &p_path);
 	static void _resource_loaded(Ref<Resource> p_resource, const String &p_path);
 
+	void _update_system_menu_icons(bool p_dark_mode);
 	void _update_theme(bool p_skip_creation = false);
 	void _build_icon_type_cache();
 	void _enable_pending_addons();
@@ -556,6 +564,7 @@ private:
 	void _export_as_menu_option(int p_idx);
 	void _update_file_menu_opened();
 	void _palette_quick_open_dialog();
+	void _clear_cache_confirmed();
 
 	void _remove_plugin_from_enabled(const String &p_name);
 	void _plugin_over_edit(EditorPlugin *p_plugin, Object *p_object, bool p_set_current = true);
@@ -716,10 +725,10 @@ private:
 	MenuType menu_type = MENU_TYPE_NONE;
 	Vector<PopupMenu *> main_menu_items;
 
-	void _build_file_menu();
-	void _build_project_menu();
-	void _build_settings_menu();
-	void _build_help_menu();
+	void _build_file_menu(bool p_dark_mode);
+	void _build_project_menu(bool p_dark_mode);
+	void _build_settings_menu(bool p_dark_mode);
+	void _build_help_menu(bool p_dark_mode);
 
 	void _update_main_menu_type();
 	void _add_to_main_menu(const String &p_name, PopupMenu *p_menu);
@@ -785,7 +794,7 @@ public:
 	static void add_init_callback(EditorNodeInitCallback p_callback) { _init_callbacks.push_back(p_callback); }
 	static void add_build_callback(EditorBuildCallback p_callback);
 
-	static bool immediate_confirmation_dialog(const String &p_text, const String &p_ok_text = TTR("Ok"), const String &p_cancel_text = TTR("Cancel"), uint32_t p_wrap_width = 0);
+	static bool immediate_confirmation_dialog(const String &p_text, const String &p_ok_text = TTRC("OK"), const String &p_cancel_text = TTRC("Cancel"), uint32_t p_wrap_width = 0);
 
 	static bool is_cmdline_mode();
 
@@ -863,7 +872,8 @@ public:
 	Node *get_edited_scene() { return editor_data.get_edited_scene_root(); }
 
 	String get_preview_locale() const;
-	void set_preview_locale(const String &p_locale);
+	bool is_pseudolocalization_enabled() const;
+	void set_preview_locale(const String &p_locale, bool p_pseudolocalization);
 
 	int new_scene();
 	Error load_scene(const String &p_scene, bool p_ignore_broken_deps = false, bool p_set_inherited = false, bool p_force_open_imported = false, bool p_update_tabs = true);
@@ -967,9 +977,8 @@ public:
 
 	bool is_object_of_custom_type(const Object *p_object, const StringName &p_class);
 
-	void show_accept(const String &p_text, const String &p_title);
-	void show_save_accept(const String &p_text, const String &p_title);
-	void show_warning(const String &p_text, const String &p_title = TTR("Warning!"));
+	void show_save_accept(const String &p_text, const String &p_ok_text = TTRC("OK"));
+	void show_warning(const String &p_text, const String &p_title = TTRC("Warning!"));
 
 	void _copy_warning(const String &p_str);
 

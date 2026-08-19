@@ -114,39 +114,6 @@ Object::Connection::operator Variant() const {
 	return d;
 }
 
-void ObjectGDExtension::create_gdtype() {
-	ERR_FAIL_COND(gdtype);
-
-	gdtype = memnew(GDType(ClassDB::get_gdtype(parent_class_name), class_name));
-	gdtype->initialize();
-}
-
-void ObjectGDExtension::destroy_gdtype() {
-	ERR_FAIL_COND(!gdtype);
-
-#ifdef TOOLS_ENABLED
-	if (!is_placeholder) {
-#endif
-		memdelete(const_cast<GDType *>(gdtype));
-#ifdef TOOLS_ENABLED
-	}
-#endif
-
-	gdtype = nullptr;
-}
-
-ObjectGDExtension::~ObjectGDExtension() {
-	if (gdtype) {
-#ifdef TOOLS_ENABLED
-		if (!is_placeholder) {
-#endif
-			memdelete(const_cast<GDType *>(gdtype));
-#ifdef TOOLS_ENABLED
-		}
-#endif
-	}
-}
-
 bool Object::Connection::operator<(const Connection &p_conn) const {
 	if (signal == p_conn.signal) {
 		return callable < p_conn.callable;
@@ -180,9 +147,7 @@ bool Object::_predelete() {
 
 	// Destruction order starts with the most derived class, and progresses towards the base Object class:
 	// Script subclasses -> GDExtension subclasses -> C++ subclasses -> Object
-	if (script_instance) {
-		memdelete(script_instance);
-	}
+	memdelete(script_instance);
 	script_instance = nullptr;
 
 	if (_extension) {
@@ -269,16 +234,8 @@ void Object::set(const StringName &p_name, const Variant &p_value, bool *r_valid
 		return;
 
 	} else {
-		Variant **V = metadata_properties.getptr(p_name);
-		if (V) {
-			**V = p_value;
-			if (r_valid) {
-				*r_valid = true;
-			}
-			return;
-		} else if (p_name.operator String().begins_with("metadata/")) {
-			// Must exist, otherwise duplicate() will not work.
-			set_meta(p_name.operator String().replace_first("metadata/", ""), p_value);
+		if (p_name.string().begins_with("metadata/")) {
+			set_meta(p_name.string().substr(strlen("metadata/")), p_value);
 			if (r_valid) {
 				*r_valid = true;
 			}
@@ -351,14 +308,21 @@ Variant Object::get(const StringName &p_name, bool *r_valid) const {
 		return ret;
 	}
 
-	const Variant *const *V = metadata_properties.getptr(p_name);
-
-	if (V) {
-		ret = **V;
-		if (r_valid) {
-			*r_valid = true;
+	if (p_name.string().begins_with("metadata/")) {
+		const StringName meta_key = p_name.string().substr(strlen("metadata/"));
+		const Variant *V = metadata.getptr(meta_key);
+		if (V) {
+			ret = *V;
+			if (r_valid) {
+				*r_valid = true;
+			}
+			return ret;
+		} else {
+			if (r_valid) {
+				*r_valid = false;
+			}
+			return Variant();
 		}
-		return ret;
 
 	} else {
 #ifdef TOOLS_ENABLED
@@ -522,7 +486,7 @@ void Object::get_property_list(List<PropertyInfo> *p_list, bool p_reversed) cons
 	}
 
 	for (const KeyValue<StringName, Variant> &K : metadata) {
-		PropertyInfo pi = PropertyInfo(K.value.get_type(), "metadata/" + K.key.operator String());
+		PropertyInfo pi = PropertyInfo(K.value.get_type(), "metadata/" + K.key.string());
 		if (K.value.get_type() == Variant::OBJECT) {
 			pi.hint = PROPERTY_HINT_RESOURCE_TYPE;
 			Object *obj = K.value;
@@ -661,8 +625,7 @@ bool Object::has_method(const StringName &p_method) const {
 		return true;
 	}
 
-	MethodBind *method = ClassDB::get_method(get_class_name(), p_method);
-	if (method != nullptr) {
+	if (get_gdtype().get_method_map(false).has(p_method)) {
 		return true;
 	}
 
@@ -817,10 +780,10 @@ Variant Object::callp(const StringName &p_method, const Variant **p_args, int p_
 
 	//extension does not need this, because all methods are registered in MethodBind
 
-	MethodBind *method = ClassDB::get_method(get_class_name(), p_method);
+	const MethodBind *const *method = get_gdtype().get_method_map(false).getptr(p_method);
 
 	if (method) {
-		ret = method->call(this, p_args, p_argcount, r_error);
+		ret = (*method)->call(this, p_args, p_argcount, r_error);
 	} else {
 		r_error.error = Callable::CallError::CALL_ERROR_INVALID_METHOD;
 	}
@@ -861,14 +824,14 @@ Variant Object::call_const(const StringName &p_method, const Variant **p_args, i
 
 	//extension does not need this, because all methods are registered in MethodBind
 
-	MethodBind *method = ClassDB::get_method(get_class_name(), p_method);
+	const MethodBind *const *method = get_gdtype().get_method_map(false).getptr(p_method);
 
 	if (method) {
-		if (!method->is_const()) {
+		if (!(*method)->is_const()) {
 			r_error.error = Callable::CallError::CALL_ERROR_METHOD_NOT_CONST;
 			return ret;
 		}
-		ret = method->call(this, p_args, p_argcount, r_error);
+		ret = (*method)->call(this, p_args, p_argcount, r_error);
 	} else {
 		r_error.error = Callable::CallError::CALL_ERROR_INVALID_METHOD;
 	}
@@ -877,17 +840,17 @@ Variant Object::call_const(const StringName &p_method, const Variant **p_args, i
 }
 
 void Object::_gdvirtual_init_method_ptr(uint32_t p_compat_hash, void *&r_fn_ptr, const StringName &p_fn_name, bool p_compat) const {
-	r_fn_ptr = nullptr;
+	void *fn_ptr = nullptr;
 	if (_extension->get_virtual_call_data2 && _extension->call_virtual_with_data) {
-		r_fn_ptr = _extension->get_virtual_call_data2(_extension->class_userdata, &p_fn_name, p_compat_hash);
+		fn_ptr = _extension->get_virtual_call_data2(_extension->class_userdata, &p_fn_name, p_compat_hash);
 	} else if (_extension->get_virtual2) {
-		r_fn_ptr = (void *)_extension->get_virtual2(_extension->class_userdata, &p_fn_name, p_compat_hash);
+		fn_ptr = (void *)_extension->get_virtual2(_extension->class_userdata, &p_fn_name, p_compat_hash);
 #ifndef DISABLE_DEPRECATED
 	} else if (p_compat || ClassDB::get_virtual_method_compatibility_hashes(get_class_name(), p_fn_name).size() == 0) {
 		if (_extension->get_virtual_call_data && _extension->call_virtual_with_data) {
-			r_fn_ptr = _extension->get_virtual_call_data(_extension->class_userdata, &p_fn_name);
+			fn_ptr = _extension->get_virtual_call_data(_extension->class_userdata, &p_fn_name);
 		} else if (_extension->get_virtual) {
-			r_fn_ptr = (void *)_extension->get_virtual(_extension->class_userdata, &p_fn_name);
+			fn_ptr = (void *)_extension->get_virtual(_extension->class_userdata, &p_fn_name);
 		}
 #endif
 	}
@@ -899,9 +862,10 @@ void Object::_gdvirtual_init_method_ptr(uint32_t p_compat_hash, void *&r_fn_ptr,
 		virtual_method_list = tracker;
 	}
 #endif
-	if (r_fn_ptr == nullptr) {
-		r_fn_ptr = reinterpret_cast<void *>(_INVALID_GDVIRTUAL_FUNC_ADDR);
+	if (fn_ptr == nullptr) {
+		fn_ptr = reinterpret_cast<void *>(_INVALID_GDVIRTUAL_FUNC_ADDR);
 	}
+	r_fn_ptr = fn_ptr;
 }
 
 void Object::_notification_forward(int p_notification) {
@@ -999,9 +963,7 @@ void Object::set_script_instance(ScriptInstance *p_instance) {
 		return;
 	}
 
-	if (script_instance) {
-		memdelete(script_instance);
-	}
+	memdelete(script_instance);
 
 	script_instance = p_instance;
 }
@@ -1020,7 +982,6 @@ void Object::set_meta(const StringName &p_name, const Variant &p_value) {
 			metadata.erase(p_name);
 
 			const String &sname = p_name;
-			metadata_properties.erase("metadata/" + sname);
 			if (!sname.begins_with("_")) {
 				// Metadata starting with _ don't show up in the inspector, so no need to update.
 				notify_property_list_changed();
@@ -1033,11 +994,10 @@ void Object::set_meta(const StringName &p_name, const Variant &p_value) {
 	if (E) {
 		E->value = p_value;
 	} else {
-		ERR_FAIL_COND_MSG(!p_name.operator String().is_valid_ascii_identifier(), vformat("Invalid metadata identifier: '%s'.", p_name));
-		Variant *V = &metadata.insert(p_name, p_value)->value;
+		ERR_FAIL_COND_MSG(!p_name.string().is_valid_unicode_identifier(), vformat("Invalid metadata identifier: '%s'.", p_name));
+		metadata.insert(p_name, p_value);
 
 		const String &sname = p_name;
-		metadata_properties["metadata/" + sname] = V;
 		if (!sname.begins_with("_")) {
 			notify_property_list_changed();
 		}
@@ -1539,7 +1499,7 @@ Error Object::connect(const StringName &p_signal, const Callable &p_callable, ui
 #ifdef TOOLS_ENABLED
 			else {
 				//allow connecting signals anyway if script is invalid, see issue #17070
-				if (!script_instance->get_script()->is_valid()) {
+				if (!script_instance->get_script()->is_script_valid()) {
 					signal_is_valid = true;
 				}
 			}
@@ -2365,9 +2325,7 @@ Object::~Object() {
 		memfree(_instance_bindings);
 	}
 
-	if (signal_mutex) {
-		memdelete(signal_mutex);
-	}
+	memdelete(signal_mutex);
 }
 
 bool predelete_handler(Object *p_object) {
@@ -2537,8 +2495,8 @@ void ObjectDB::cleanup() {
 			// Ensure calling the native classes because if a leaked instance has a script
 			// that overrides any of those methods, it'd not be OK to call them at this point,
 			// now the scripting languages have already been terminated.
-			MethodBind *node_get_path = ClassDB::get_method("Node", "get_path");
-			MethodBind *resource_get_path = ClassDB::get_method("Resource", "get_path");
+			const MethodBind *node_get_path = ClassDB::get_method("Node", "get_path");
+			const MethodBind *resource_get_path = ClassDB::get_method("Resource", "get_path");
 			Callable::CallError call_error;
 
 			for (uint32_t i = 0, count = slot_count; i < slot_max && count != 0; i++) {

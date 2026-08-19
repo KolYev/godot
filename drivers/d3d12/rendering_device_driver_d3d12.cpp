@@ -913,6 +913,15 @@ RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitFiel
 				resource_desc.Flags = resource_desc.Flags & ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 			}
 		} break;
+		case MEMORY_ALLOCATION_TYPE_GPU_MAPPABLE: {
+			if (misc_features_support.gpu_upload_heap_supported) {
+				allocation_desc.HeapType = D3D12_HEAP_TYPE_GPU_UPLOAD;
+			} else if (misc_features_support.uma_supported) {
+				allocation_desc.CustomPool = uma_gpu_mappable_pool.Get();
+			} else {
+				ERR_FAIL_V_MSG(BufferID(), "GPU mappable buffers are unsupported on this device.");
+			}
+		} break;
 	}
 
 	ComPtr<ID3D12Resource> buffer;
@@ -1288,7 +1297,6 @@ RDD::TextureID RenderingDeviceDriverD3D12::texture_create(const TextureFormat &p
 			relaxed_casting_format_count++;
 		}
 
-		HashMap<DataFormat, D3D12_RESOURCE_FLAGS> aliases_forbidden_flags;
 		for (int i = 0; i < p_format.shareable_formats.size(); i++) {
 			DataFormat curr_format = p_format.shareable_formats[i];
 			String format_text = "'" + String(FORMAT_NAMES[p_format.format]) + "'";
@@ -3971,7 +3979,7 @@ void RenderingDeviceDriverD3D12::command_clear_color_texture(CommandBufferID p_c
 
 			cmd_buf_info->cmd_list->ClearRenderTargetView(
 					cmd_buf_info->rtv_alloc.cpu_handle,
-					p_color.components,
+					p_color.as_float4_buffer(),
 					0,
 					nullptr);
 		}
@@ -4004,7 +4012,7 @@ void RenderingDeviceDriverD3D12::command_clear_color_texture(CommandBufferID p_c
 					shader_visible_descriptor_allocation.gpu_handle,
 					cmd_buf_info->uav_alloc.cpu_handle,
 					tex_info->resource,
-					p_color.components,
+					p_color.as_float4_buffer(),
 					0,
 					nullptr);
 		}
@@ -4763,7 +4771,7 @@ void RenderingDeviceDriverD3D12::command_render_clear_attachments(CommandBufferI
 				uint32_t color_idx = fb_info->attachments_handle_inds[attachment];
 				cmd_buf_info->cmd_list->ClearRenderTargetView(
 						get_cpu_handle(fb_info->rtv_alloc.cpu_handle, color_idx, rtv_descriptor_heap_pool.increment_size),
-						p_attachment_clears[i].value.color.components,
+						p_attachment_clears[i].value.color.as_float4_buffer(),
 						rect_ptr ? 1 : 0,
 						rect_ptr);
 			} else {
@@ -4815,7 +4823,7 @@ void RenderingDeviceDriverD3D12::command_bind_render_pipeline(CommandBufferID p_
 	}
 
 	if (cmd_buf_info->pending_dyn_params || (cmd_buf_info->dyn_params.blend_constant != render_info.dyn_params.blend_constant)) {
-		cmd_buf_info->cmd_list->OMSetBlendFactor(render_info.dyn_params.blend_constant.components);
+		cmd_buf_info->cmd_list->OMSetBlendFactor(render_info.dyn_params.blend_constant.as_float4_buffer());
 		cmd_buf_info->dyn_params.blend_constant = render_info.dyn_params.blend_constant;
 	}
 
@@ -5005,7 +5013,7 @@ void RenderingDeviceDriverD3D12::_bind_vertex_buffers(CommandBufferInfo *p_cmd_b
 
 void RenderingDeviceDriverD3D12::command_render_set_blend_constants(CommandBufferID p_cmd_buffer, const Color &p_constants) {
 	const CommandBufferInfo *cmd_buf_info = (const CommandBufferInfo *)p_cmd_buffer.id;
-	cmd_buf_info->cmd_list->OMSetBlendFactor(p_constants.components);
+	cmd_buf_info->cmd_list->OMSetBlendFactor(p_constants.as_float4_buffer());
 }
 
 void RenderingDeviceDriverD3D12::command_render_set_line_width(CommandBufferID p_cmd_buffer, float p_width) {
@@ -5131,7 +5139,6 @@ RDD::PipelineID RenderingDeviceDriverD3D12::render_pipeline_create(
 	RenderPipelineInfo render_info;
 
 	// Attachments.
-	LocalVector<uint32_t> color_attachments;
 	{
 		const Subpass &subpass = pass_info->subpasses[p_render_subpass];
 
@@ -5892,6 +5899,8 @@ bool RenderingDeviceDriverD3D12::has_feature(Features p_feature) {
 			return false;
 		case SUPPORTS_HDR_OUTPUT:
 			return true;
+		case SUPPORTS_GPU_MAPPABLE_BUFFER:
+			return misc_features_support.uma_supported || misc_features_support.gpu_upload_heap_supported;
 		default:
 			return false;
 	}
@@ -6322,6 +6331,24 @@ Error RenderingDeviceDriverD3D12::_initialize_allocator() {
 		// Print it as a warning (instead of verbose) because in the rare chance this lesser-used code path
 		// causes bugs, we get an inkling of what's going on (i.e. in order to repro bugs locally).
 		print_verbose("D3D12: Device does NOT support GPU UPLOAD heap. ReBAR must be enabled for this feature. Regular UPLOAD heaps will be used as fallback.");
+	}
+
+	misc_features_support.uma_supported = allocator->IsUMA();
+	misc_features_support.gpu_upload_heap_supported = allocator->IsGPUUploadHeapSupported();
+
+	// If UMA is supported but GPU upload heap isn't, the same functionality can be achieved
+	// by creating resources from a pool with the same properties as an upload heap.
+	if (misc_features_support.uma_supported && !misc_features_support.gpu_upload_heap_supported) {
+		D3D12MA::POOL_DESC pool_desc = {};
+#if defined(_MSC_VER) || !defined(_WIN32)
+		pool_desc.HeapProperties = device->GetCustomHeapProperties(0, D3D12_HEAP_TYPE_UPLOAD);
+#else
+		device->GetCustomHeapProperties(&pool_desc.HeapProperties, 0, D3D12_HEAP_TYPE_UPLOAD);
+#endif
+		pool_desc.HeapFlags = D3D12MA_RECOMMENDED_HEAP_FLAGS | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+		res = allocator->CreatePool(&pool_desc, uma_gpu_mappable_pool.GetAddressOf());
+
+		ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_CANT_CREATE, "D3D12MA::Allocator::CreatePool failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 	}
 
 	return OK;
